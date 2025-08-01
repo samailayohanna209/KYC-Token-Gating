@@ -9,6 +9,14 @@
 (define-constant ERR_PASS_NOT_TRANSFERABLE (err u107))
 (define-constant ERR_INVALID_TRANSFER_PRICE (err u108))
 (define-constant ERR_CANNOT_TRANSFER_TO_SELF (err u109))
+(define-constant ERR_INVALID_RENEWAL_PERIOD (err u110))
+(define-constant ERR_PASS_NOT_RENEWABLE (err u111))
+(define-constant ERR_PROPOSAL_NOT_FOUND (err u112))
+(define-constant ERR_ALREADY_VOTED (err u113))
+(define-constant ERR_PROPOSAL_EXPIRED (err u114))
+(define-constant ERR_PROPOSAL_ALREADY_EXECUTED (err u115))
+(define-constant ERR_INSUFFICIENT_SIGNATURES (err u116))
+(define-constant ERR_INVALID_SIGNERS_COUNT (err u117))
 
 (define-map kyc-verified-users principal bool)
 (define-map access-passes 
@@ -27,11 +35,32 @@
   { user: principal, pass-id: uint }
   { price: uint, active: bool }
 )
+(define-map multisig-proposals
+  uint
+  {
+    proposer: principal,
+    action: (string-ascii 50),
+    target: principal,
+    amount: uint,
+    created-at: uint,
+    expires-at: uint,
+    executed: bool,
+    required-signatures: uint,
+    current-signatures: uint
+  }
+)
+(define-map proposal-votes
+  { proposal-id: uint, signer: principal }
+  bool
+)
+(define-map authorized-signers principal bool)
 
 (define-data-var next-pass-id uint u1)
 (define-data-var kyc-fee uint u1000000)
 (define-data-var pass-price uint u500000)
 (define-data-var pass-validity-period uint u144)
+(define-data-var next-proposal-id uint u1)
+(define-data-var proposal-validity-blocks uint u1008)
 
 (define-read-only (is-kyc-verified (user principal))
   (default-to false (map-get? kyc-verified-users user))
@@ -71,6 +100,32 @@
     pass-validity-blocks: (var-get pass-validity-period),
     total-passes-issued: (- (var-get next-pass-id) u1)
   }
+)
+
+(define-read-only (is-authorized-signer (user principal))
+  (default-to false (map-get? authorized-signers user))
+)
+
+(define-read-only (get-proposal-details (proposal-id uint))
+  (map-get? multisig-proposals proposal-id)
+)
+
+(define-read-only (has-voted (proposal-id uint) (signer principal))
+  (default-to false (map-get? proposal-votes { proposal-id: proposal-id, signer: signer }))
+)
+
+(define-read-only (get-proposal-status (proposal-id uint))
+  (match (map-get? multisig-proposals proposal-id)
+    proposal-data
+    {
+      exists: true,
+      executed: (get executed proposal-data),
+      expired: (> stacks-block-height (get expires-at proposal-data)),
+      signatures: (get current-signatures proposal-data),
+      required: (get required-signatures proposal-data)
+    }
+    { exists: false, executed: false, expired: false, signatures: u0, required: u0 }
+  )
 )
 
 (define-public (submit-kyc-verification)
@@ -308,6 +363,90 @@
         (ok true)
       )
       ERR_PASS_NOT_FOUND
+    )
+  )
+)
+
+(define-public (add-authorized-signer (signer principal) (required-signatures uint))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+    (asserts! (is-kyc-verified signer) ERR_NOT_KYC_VERIFIED)
+    (asserts! (>= required-signatures u2) ERR_INVALID_SIGNERS_COUNT)
+    (map-set authorized-signers signer true)
+    (ok true)
+  )
+)
+
+(define-public (remove-authorized-signer (signer principal))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+    (map-delete authorized-signers signer)
+    (ok true)
+  )
+)
+
+(define-public (create-multisig-proposal (action (string-ascii 50)) (target principal) (amount uint) (required-signatures uint))
+  (let (
+    (proposer tx-sender)
+    (current-proposal-id (var-get next-proposal-id))
+  )
+    (asserts! (is-authorized-signer proposer) ERR_UNAUTHORIZED)
+    (asserts! (>= required-signatures u2) ERR_INVALID_SIGNERS_COUNT)
+    (map-set multisig-proposals current-proposal-id
+      {
+        proposer: proposer,
+        action: action,
+        target: target,
+        amount: amount,
+        created-at: stacks-block-height,
+        expires-at: (+ stacks-block-height (var-get proposal-validity-blocks)),
+        executed: false,
+        required-signatures: required-signatures,
+        current-signatures: u1
+      }
+    )
+    (map-set proposal-votes { proposal-id: current-proposal-id, signer: proposer } true)
+    (var-set next-proposal-id (+ current-proposal-id u1))
+    (ok current-proposal-id)
+  )
+)
+
+(define-public (vote-on-proposal (proposal-id uint))
+  (let ((signer tx-sender))
+    (asserts! (is-authorized-signer signer) ERR_UNAUTHORIZED)
+    (asserts! (not (has-voted proposal-id signer)) ERR_ALREADY_VOTED)
+    (match (map-get? multisig-proposals proposal-id)
+      proposal-data
+      (begin
+        (asserts! (< stacks-block-height (get expires-at proposal-data)) ERR_PROPOSAL_EXPIRED)
+        (asserts! (not (get executed proposal-data)) ERR_PROPOSAL_ALREADY_EXECUTED)
+        (map-set proposal-votes { proposal-id: proposal-id, signer: signer } true)
+        (map-set multisig-proposals proposal-id
+          (merge proposal-data { current-signatures: (+ (get current-signatures proposal-data) u1) })
+        )
+        (ok true)
+      )
+      ERR_PROPOSAL_NOT_FOUND
+    )
+  )
+)
+
+(define-public (execute-multisig-proposal (proposal-id uint))
+  (let ((executor tx-sender))
+    (asserts! (is-authorized-signer executor) ERR_UNAUTHORIZED)
+    (match (map-get? multisig-proposals proposal-id)
+      proposal-data
+      (begin
+        (asserts! (< stacks-block-height (get expires-at proposal-data)) ERR_PROPOSAL_EXPIRED)
+        (asserts! (not (get executed proposal-data)) ERR_PROPOSAL_ALREADY_EXECUTED)
+        (asserts! (>= (get current-signatures proposal-data) (get required-signatures proposal-data)) ERR_INSUFFICIENT_SIGNATURES)
+        (map-set multisig-proposals proposal-id (merge proposal-data { executed: true }))
+        (if (is-eq (get action proposal-data) "transfer")
+          (as-contract (stx-transfer? (get amount proposal-data) tx-sender (get target proposal-data)))
+          (ok true)
+        )
+      )
+      ERR_PROPOSAL_NOT_FOUND
     )
   )
 )
