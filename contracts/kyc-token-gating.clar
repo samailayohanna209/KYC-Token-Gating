@@ -17,6 +17,11 @@
 (define-constant ERR_PROPOSAL_ALREADY_EXECUTED (err u115))
 (define-constant ERR_INSUFFICIENT_SIGNATURES (err u116))
 (define-constant ERR_INVALID_SIGNERS_COUNT (err u117))
+(define-constant ERR_REFERRAL_CODE_NOT_FOUND (err u118))
+(define-constant ERR_REFERRAL_ALREADY_USED (err u119))
+(define-constant ERR_SELF_REFERRAL (err u120))
+(define-constant ERR_NO_PENDING_REWARDS (err u121))
+(define-constant ERR_REFERRAL_CODE_EXISTS (err u122))
 
 (define-map kyc-verified-users principal bool)
 (define-map access-passes 
@@ -54,6 +59,29 @@
   bool
 )
 (define-map authorized-signers principal bool)
+(define-map referral-codes 
+  (string-ascii 20) 
+  { 
+    referrer: principal, 
+    created-at: uint, 
+    active: bool 
+  }
+)
+(define-map user-referral-stats 
+  principal 
+  { 
+    total-referrals: uint, 
+    pending-rewards: uint, 
+    lifetime-rewards: uint 
+  }
+)
+(define-map referral-relationships 
+  principal 
+  { 
+    referrer: principal, 
+    referred-at: uint 
+  }
+)
 
 (define-data-var next-pass-id uint u1)
 (define-data-var kyc-fee uint u1000000)
@@ -61,6 +89,7 @@
 (define-data-var pass-validity-period uint u144)
 (define-data-var next-proposal-id uint u1)
 (define-data-var proposal-validity-blocks uint u1008)
+(define-data-var referral-reward-amount uint u100000)
 
 (define-read-only (is-kyc-verified (user principal))
   (default-to false (map-get? kyc-verified-users user))
@@ -128,12 +157,65 @@
   )
 )
 
+(define-read-only (get-referral-code-details (referral-code (string-ascii 20)))
+  (map-get? referral-codes referral-code)
+)
+
+(define-read-only (get-user-referral-stats (user principal))
+  (default-to 
+    { total-referrals: u0, pending-rewards: u0, lifetime-rewards: u0 }
+    (map-get? user-referral-stats user)
+  )
+)
+
+(define-read-only (get-referral-relationship (user principal))
+  (map-get? referral-relationships user)
+)
+
+(define-read-only (get-referral-reward-amount)
+  (var-get referral-reward-amount)
+)
+
 (define-public (submit-kyc-verification)
   (let ((user tx-sender))
     (asserts! (not (is-kyc-verified user)) ERR_ALREADY_KYC_VERIFIED)
     (try! (stx-transfer? (var-get kyc-fee) user CONTRACT_OWNER))
     (map-set kyc-verified-users user true)
     (ok true)
+  )
+)
+
+(define-public (submit-kyc-with-referral (referral-code (string-ascii 20)))
+  (let (
+    (user tx-sender)
+  )
+    (asserts! (not (is-kyc-verified user)) ERR_ALREADY_KYC_VERIFIED)
+    (match (map-get? referral-codes referral-code)
+      code-data
+      (begin
+        (asserts! (get active code-data) ERR_REFERRAL_CODE_NOT_FOUND)
+        (asserts! (not (is-eq user (get referrer code-data))) ERR_SELF_REFERRAL)
+        (asserts! (is-none (map-get? referral-relationships user)) ERR_REFERRAL_ALREADY_USED)
+        (try! (stx-transfer? (var-get kyc-fee) user CONTRACT_OWNER))
+        (map-set kyc-verified-users user true)
+        (map-set referral-relationships user {
+          referrer: (get referrer code-data),
+          referred-at: stacks-block-height
+        })
+        (let (
+          (referrer (get referrer code-data))
+          (current-stats (get-user-referral-stats referrer))
+        )
+          (map-set user-referral-stats referrer {
+            total-referrals: (+ (get total-referrals current-stats) u1),
+            pending-rewards: (+ (get pending-rewards current-stats) (var-get referral-reward-amount)),
+            lifetime-rewards: (get lifetime-rewards current-stats)
+          })
+        )
+        (ok true)
+      )
+      ERR_REFERRAL_CODE_NOT_FOUND
+    )
   )
 )
 
@@ -448,5 +530,59 @@
       )
       ERR_PROPOSAL_NOT_FOUND
     )
+  )
+)
+
+(define-public (generate-referral-code (referral-code (string-ascii 20)))
+  (let ((user tx-sender))
+    (asserts! (is-kyc-verified user) ERR_NOT_KYC_VERIFIED)
+    (asserts! (is-none (map-get? referral-codes referral-code)) ERR_REFERRAL_CODE_EXISTS)
+    (map-set referral-codes referral-code {
+      referrer: user,
+      created-at: stacks-block-height,
+      active: true
+    })
+    (ok referral-code)
+  )
+)
+
+(define-public (deactivate-referral-code (referral-code (string-ascii 20)))
+  (let ((user tx-sender))
+    (asserts! (is-kyc-verified user) ERR_NOT_KYC_VERIFIED)
+    (match (map-get? referral-codes referral-code)
+      code-data
+      (begin
+        (asserts! (is-eq user (get referrer code-data)) ERR_UNAUTHORIZED)
+        (map-set referral-codes referral-code (merge code-data { active: false }))
+        (ok true)
+      )
+      ERR_REFERRAL_CODE_NOT_FOUND
+    )
+  )
+)
+
+(define-public (claim-referral-rewards)
+  (let (
+    (user tx-sender)
+    (current-stats (get-user-referral-stats user))
+    (pending-amount (get pending-rewards current-stats))
+  )
+    (asserts! (is-kyc-verified user) ERR_NOT_KYC_VERIFIED)
+    (asserts! (> pending-amount u0) ERR_NO_PENDING_REWARDS)
+    (try! (as-contract (stx-transfer? pending-amount tx-sender user)))
+    (map-set user-referral-stats user {
+      total-referrals: (get total-referrals current-stats),
+      pending-rewards: u0,
+      lifetime-rewards: (+ (get lifetime-rewards current-stats) pending-amount)
+    })
+    (ok pending-amount)
+  )
+)
+
+(define-public (update-referral-reward-amount (new-amount uint))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+    (var-set referral-reward-amount new-amount)
+    (ok true)
   )
 )
