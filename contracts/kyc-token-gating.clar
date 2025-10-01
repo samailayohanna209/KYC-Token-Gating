@@ -22,6 +22,11 @@
 (define-constant ERR_SELF_REFERRAL (err u120))
 (define-constant ERR_NO_PENDING_REWARDS (err u121))
 (define-constant ERR_REFERRAL_CODE_EXISTS (err u122))
+(define-constant ERR_RENTAL_NOT_FOUND (err u123))
+(define-constant ERR_RENTAL_ALREADY_ACTIVE (err u124))
+(define-constant ERR_RENTAL_EXPIRED (err u125))
+(define-constant ERR_INVALID_RENTAL_DURATION (err u126))
+(define-constant ERR_PASS_CURRENTLY_RENTED (err u127))
 
 (define-map kyc-verified-users principal bool)
 (define-map access-passes 
@@ -80,6 +85,23 @@
   { 
     referrer: principal, 
     referred-at: uint 
+  }
+)
+(define-map rental-listings
+  { owner: principal, pass-id: uint }
+  {
+    rental-price: uint,
+    rental-duration: uint,
+    active: bool
+  }
+)
+(define-map active-rentals
+  { owner: principal, pass-id: uint }
+  {
+    renter: principal,
+    rental-start: uint,
+    rental-end: uint,
+    rental-price: uint
   }
 )
 
@@ -174,6 +196,22 @@
 
 (define-read-only (get-referral-reward-amount)
   (var-get referral-reward-amount)
+)
+
+(define-read-only (get-rental-listing (owner principal) (pass-id uint))
+  (map-get? rental-listings { owner: owner, pass-id: pass-id })
+)
+
+(define-read-only (get-active-rental (owner principal) (pass-id uint))
+  (map-get? active-rentals { owner: owner, pass-id: pass-id })
+)
+
+(define-read-only (is-pass-rented (owner principal) (pass-id uint))
+  (match (map-get? active-rentals { owner: owner, pass-id: pass-id })
+    rental-data
+    (< stacks-block-height (get rental-end rental-data))
+    false
+  )
 )
 
 (define-public (submit-kyc-verification)
@@ -584,5 +622,131 @@
     (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
     (var-set referral-reward-amount new-amount)
     (ok true)
+  )
+)
+
+(define-public (list-pass-for-rental (pass-id uint) (rental-price uint) (rental-duration uint))
+  (let (
+    (owner tx-sender)
+    (pass-key { user: owner, pass-id: pass-id })
+    (listing-key { owner: owner, pass-id: pass-id })
+  )
+    (asserts! (is-kyc-verified owner) ERR_NOT_KYC_VERIFIED)
+    (asserts! (> rental-price u0) ERR_INVALID_TRANSFER_PRICE)
+    (asserts! (> rental-duration u0) ERR_INVALID_RENTAL_DURATION)
+    (asserts! (not (is-pass-rented owner pass-id)) ERR_RENTAL_ALREADY_ACTIVE)
+    (match (map-get? access-passes pass-key)
+      pass-data
+      (begin
+        (asserts! (not (get used pass-data)) ERR_PASS_ALREADY_USED)
+        (asserts! (< stacks-block-height (get expires-at pass-data)) ERR_PASS_EXPIRED)
+        (map-set rental-listings listing-key {
+          rental-price: rental-price,
+          rental-duration: rental-duration,
+          active: true
+        })
+        (ok true)
+      )
+      ERR_PASS_NOT_FOUND
+    )
+  )
+)
+
+(define-public (cancel-rental-listing (pass-id uint))
+  (let (
+    (owner tx-sender)
+    (listing-key { owner: owner, pass-id: pass-id })
+  )
+    (asserts! (is-kyc-verified owner) ERR_NOT_KYC_VERIFIED)
+    (asserts! (not (is-pass-rented owner pass-id)) ERR_RENTAL_ALREADY_ACTIVE)
+    (map-delete rental-listings listing-key)
+    (ok true)
+  )
+)
+
+(define-public (rent-pass (owner principal) (pass-id uint))
+  (let (
+    (renter tx-sender)
+    (pass-key { user: owner, pass-id: pass-id })
+    (listing-key { owner: owner, pass-id: pass-id })
+    (rental-key { owner: owner, pass-id: pass-id })
+  )
+    (asserts! (is-kyc-verified renter) ERR_NOT_KYC_VERIFIED)
+    (asserts! (not (is-eq renter owner)) ERR_CANNOT_TRANSFER_TO_SELF)
+    (asserts! (not (is-pass-rented owner pass-id)) ERR_RENTAL_ALREADY_ACTIVE)
+    (match (map-get? rental-listings listing-key)
+      listing-data
+      (match (map-get? access-passes pass-key)
+        pass-data
+        (begin
+          (asserts! (get active listing-data) ERR_RENTAL_NOT_FOUND)
+          (asserts! (not (get used pass-data)) ERR_PASS_ALREADY_USED)
+          (asserts! (< stacks-block-height (get expires-at pass-data)) ERR_PASS_EXPIRED)
+          (try! (stx-transfer? (get rental-price listing-data) renter owner))
+          (map-set active-rentals rental-key {
+            renter: renter,
+            rental-start: stacks-block-height,
+            rental-end: (+ stacks-block-height (get rental-duration listing-data)),
+            rental-price: (get rental-price listing-data)
+          })
+          (map-set rental-listings listing-key (merge listing-data { active: false }))
+          (ok pass-id)
+        )
+        ERR_PASS_NOT_FOUND
+      )
+      ERR_RENTAL_NOT_FOUND
+    )
+  )
+)
+
+(define-public (end-rental (owner principal) (pass-id uint))
+  (let (
+    (caller tx-sender)
+    (rental-key { owner: owner, pass-id: pass-id })
+  )
+    (match (map-get? active-rentals rental-key)
+      rental-data
+      (begin
+        (asserts! 
+          (or 
+            (is-eq caller owner)
+            (and (is-eq caller (get renter rental-data)) (>= stacks-block-height (get rental-end rental-data)))
+          ) 
+          ERR_UNAUTHORIZED
+        )
+        (map-delete active-rentals rental-key)
+        (ok true)
+      )
+      ERR_RENTAL_NOT_FOUND
+    )
+  )
+)
+
+(define-public (use-rented-pass (owner principal) (pass-id uint))
+  (let (
+    (user tx-sender)
+    (pass-key { user: owner, pass-id: pass-id })
+    (rental-key { owner: owner, pass-id: pass-id })
+  )
+    (asserts! (is-kyc-verified user) ERR_NOT_KYC_VERIFIED)
+    (match (map-get? active-rentals rental-key)
+      rental-data
+      (begin
+        (asserts! (is-eq user (get renter rental-data)) ERR_UNAUTHORIZED)
+        (asserts! (< stacks-block-height (get rental-end rental-data)) ERR_RENTAL_EXPIRED)
+        (match (map-get? access-passes pass-key)
+          pass-data
+          (begin
+            (asserts! (not (get used pass-data)) ERR_PASS_ALREADY_USED)
+            (asserts! (< stacks-block-height (get expires-at pass-data)) ERR_PASS_EXPIRED)
+            (map-set access-passes pass-key (merge pass-data { used: true }))
+            (map-delete active-rentals rental-key)
+            (ok (get pass-type pass-data))
+          )
+          ERR_PASS_NOT_FOUND
+        )
+      )
+      ERR_RENTAL_NOT_FOUND
+    )
   )
 )
