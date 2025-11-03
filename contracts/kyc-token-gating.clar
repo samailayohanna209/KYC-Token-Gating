@@ -112,6 +112,7 @@
 (define-data-var next-proposal-id uint u1)
 (define-data-var proposal-validity-blocks uint u1008)
 (define-data-var referral-reward-amount uint u100000)
+(define-data-var renewal-fee uint u250000)
 
 (define-read-only (is-kyc-verified (user principal))
   (default-to false (map-get? kyc-verified-users user))
@@ -196,6 +197,10 @@
 
 (define-read-only (get-referral-reward-amount)
   (var-get referral-reward-amount)
+)
+
+(define-read-only (get-renewal-fee)
+  (var-get renewal-fee)
 )
 
 (define-read-only (get-rental-listing (owner principal) (pass-id uint))
@@ -309,6 +314,26 @@
   )
 )
 
+(define-public (renew-access-pass (pass-id uint) (extension uint))
+  (let (
+    (user tx-sender)
+    (pass-key { user: user, pass-id: pass-id })
+  )
+    (asserts! (is-kyc-verified user) ERR_NOT_KYC_VERIFIED)
+    (asserts! (> extension u0) ERR_INVALID_RENEWAL_PERIOD)
+    (match (map-get? access-passes pass-key)
+      pass-data
+      (begin
+        (asserts! (not (get used pass-data)) ERR_PASS_ALREADY_USED)
+        (try! (stx-transfer? (var-get renewal-fee) user CONTRACT_OWNER))
+        (map-set access-passes pass-key (merge pass-data { expires-at: (+ (get expires-at pass-data) extension) }))
+        (ok true)
+      )
+      ERR_PASS_NOT_FOUND
+    )
+  )
+)
+
 (define-public (access-premium-feature (feature-name (string-ascii 100)))
   (let ((user tx-sender))
     (asserts! (is-kyc-verified user) ERR_NOT_KYC_VERIFIED)
@@ -363,6 +388,14 @@
   (begin
     (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
     (var-set pass-validity-period new-validity)
+    (ok true)
+  )
+)
+
+(define-public (update-renewal-fee (new-fee uint))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+    (var-set renewal-fee new-fee)
     (ok true)
   )
 )
